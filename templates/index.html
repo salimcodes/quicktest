@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>African Languages Speech-to-Text</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+        h1 { font-size: 1.4em; }
+        label { font-weight: bold; }
+        select { font-size: 1em; padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; margin-bottom: 16px; }
+        button { font-size: 1.1em; padding: 12px 32px; cursor: pointer; border: none; border-radius: 6px; color: #fff; }
+        #recordBtn { background: #2563eb; }
+        #recordBtn.recording { background: #dc2626; }
+        #recordBtn:disabled { background: #9ca3af; cursor: not-allowed; }
+        #status { margin-top: 16px; color: #666; }
+        #result { margin-top: 20px; padding: 16px; background: #f3f4f6; border-radius: 6px; white-space: pre-wrap; min-height: 40px; }
+        .provider { font-size: 0.85em; color: #888; margin-top: -10px; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <h1>African Languages Speech-to-Text</h1>
+
+    <label for="lang">Language:</label><br>
+    <select id="lang" onchange="updateProvider()">
+        <optgroup label="ElevenLabs Scribe v2">
+            <option value="ha">Hausa</option>
+            <option value="ig">Igbo</option>
+            <option value="sw">Swahili</option>
+            <option value="xh">Xhosa</option>
+            <option value="zu">Zulu</option>
+        </optgroup>
+        <optgroup label="Intron">
+            <option value="yo">Yoruba</option>
+            <option value="tw">Twi</option>
+        </optgroup>
+    </select>
+    <div class="provider" id="provider"></div>
+
+    <button id="recordBtn" onclick="toggleRecording()">🎙 Record</button>
+    <div id="status"></div>
+    <h3>Transcription:</h3>
+    <div id="result">—</div>
+
+    <script>
+        let mediaRecorder = null;
+        let chunks = [];
+        let recording = false;
+
+        const btn = document.getElementById('recordBtn');
+        const status = document.getElementById('status');
+        const result = document.getElementById('result');
+        const langSelect = document.getElementById('lang');
+        const providerEl = document.getElementById('provider');
+
+        const INTRON_LANGS = new Set(['yo', 'tw']);
+
+        function providerFor(lang) {
+            return INTRON_LANGS.has(lang) ? 'Intron' : 'ElevenLabs Scribe v2';
+        }
+
+        function updateProvider() {
+            providerEl.textContent = 'Provider: ' + providerFor(langSelect.value);
+        }
+        updateProvider();
+
+        async function toggleRecording() {
+            if (!recording) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    chunks = [];
+
+                    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+                    mediaRecorder.onstop = () => {
+                        stream.getTracks().forEach(t => t.stop());
+                        const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+                        sendAudio(blob);
+                    };
+
+                    mediaRecorder.start();
+                    recording = true;
+                    btn.textContent = '⏹ Stop';
+                    btn.classList.add('recording');
+                    langSelect.disabled = true;
+                    status.textContent = 'Recording… (' + langSelect.selectedOptions[0].text + ' via ' + providerFor(langSelect.value) + ')';
+                } catch (err) {
+                    status.textContent = 'Microphone access denied: ' + err.message;
+                }
+            } else {
+                mediaRecorder.stop();
+                recording = false;
+                btn.textContent = '🎙 Record';
+                btn.classList.remove('recording');
+                btn.disabled = true;
+                status.textContent = 'Transcribing with ' + providerFor(langSelect.value) + '…';
+            }
+        }
+
+        async function sendAudio(blob) {
+            const fd = new FormData();
+            fd.append('audio', blob, 'recording.webm');
+            fd.append('language', langSelect.value);
+
+            try {
+                const resp = await fetch('/transcribe', { method: 'POST', body: fd });
+                const data = await resp.json();
+
+                if (resp.ok) {
+                    result.textContent = data.text || '(no speech detected)';
+                    status.textContent = 'Done — language: ' + (data.language || 'N/A');
+                } else {
+                    result.textContent = 'Error: ' + (data.error || 'Unknown error') + (data.detail ? '\n\n' + data.detail : '');
+                    status.textContent = '';
+                }
+            } catch (err) {
+                result.textContent = 'Network error: ' + err.message;
+                status.textContent = '';
+            }
+            btn.disabled = false;
+            langSelect.disabled = false;
+        }
+    </script>
+</body>
+</html>
