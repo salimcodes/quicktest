@@ -16,6 +16,7 @@
         #status { margin-top: 16px; color: #666; }
         #result { margin-top: 20px; padding: 16px; background: #f3f4f6; border-radius: 6px; white-space: pre-wrap; min-height: 40px; }
         .provider { font-size: 0.85em; color: #888; margin-top: -10px; margin-bottom: 16px; }
+        .hint { font-size: 0.85em; color: #999; margin-top: 6px; }
     </style>
 </head>
 <body>
@@ -30,7 +31,7 @@
             <option value="xh">Xhosa</option>
             <option value="zu">Zulu</option>
         </optgroup>
-        <optgroup label="Intron">
+        <optgroup label="Intron (file API)">
             <option value="yo">Yoruba</option>
             <option value="tw">Twi</option>
         </optgroup>
@@ -39,28 +40,34 @@
 
     <button id="recordBtn" onclick="toggleRecording()">🎙 Record</button>
     <div id="status"></div>
+    <div class="hint" id="intronHint" style="display:none;">
+        Note: Intron sync API supports recordings ≤ 60 seconds. Longer audio will be polled asynchronously and may take longer to return.
+    </div>
     <h3>Transcription:</h3>
     <div id="result">—</div>
 
     <script>
-        let mediaRecorder = null;
-        let chunks = [];
-        let recording = false;
+        const INTRON_LANGS = new Set(['yo', 'tw']);
 
         const btn = document.getElementById('recordBtn');
         const status = document.getElementById('status');
         const result = document.getElementById('result');
         const langSelect = document.getElementById('lang');
         const providerEl = document.getElementById('provider');
+        const intronHint = document.getElementById('intronHint');
 
-        const INTRON_LANGS = new Set(['yo', 'tw']);
+        let mediaRecorder = null;
+        let chunks = [];
+        let recording = false;
 
         function providerFor(lang) {
-            return INTRON_LANGS.has(lang) ? 'Intron' : 'ElevenLabs Scribe v2';
+            return INTRON_LANGS.has(lang) ? 'Intron file API' : 'ElevenLabs Scribe v2';
         }
 
         function updateProvider() {
-            providerEl.textContent = 'Provider: ' + providerFor(langSelect.value);
+            const lang = langSelect.value;
+            providerEl.textContent = 'Provider: ' + providerFor(lang);
+            intronHint.style.display = INTRON_LANGS.has(lang) ? 'block' : 'none';
         }
         updateProvider();
 
@@ -83,7 +90,7 @@
                     btn.textContent = '⏹ Stop';
                     btn.classList.add('recording');
                     langSelect.disabled = true;
-                    status.textContent = 'Recording… (' + langSelect.selectedOptions[0].text + ' via ' + providerFor(langSelect.value) + ')';
+                    status.textContent = 'Recording… (' + langSelect.selectedOptions[0].text + ')';
                 } catch (err) {
                     status.textContent = 'Microphone access denied: ' + err.message;
                 }
@@ -93,7 +100,7 @@
                 btn.textContent = '🎙 Record';
                 btn.classList.remove('recording');
                 btn.disabled = true;
-                status.textContent = 'Transcribing with ' + providerFor(langSelect.value) + '…';
+                status.textContent = 'Transcribing with ' + providerFor(langSelect.value) + '… (this may take up to a minute)';
             }
         }
 
@@ -110,7 +117,11 @@
                     result.textContent = data.text || '(no speech detected)';
                     status.textContent = 'Done — language: ' + (data.language || 'N/A');
                 } else {
-                    result.textContent = 'Error: ' + (data.error || 'Unknown error') + (data.detail ? '\n\n' + data.detail : '');
+                    let msg = 'Error: ' + (data.error || 'Unknown error');
+                    if (data.detail) {
+                        msg += '\n\n' + (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail, null, 2));
+                    }
+                    result.textContent = msg;
                     status.textContent = '';
                 }
             } catch (err) {
