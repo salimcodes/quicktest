@@ -8,7 +8,7 @@
         body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
         h1 { font-size: 1.4em; }
         label { font-weight: bold; }
-        select { font-size: 1em; padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; margin-bottom: 16px; }
+        select { font-size: 1em; padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; margin-bottom: 16px; min-width: 280px; }
         button { font-size: 1.1em; padding: 12px 32px; cursor: pointer; border: none; border-radius: 6px; color: #fff; }
         #recordBtn { background: #2563eb; }
         #recordBtn.recording { background: #dc2626; }
@@ -22,18 +22,22 @@
 <body>
     <h1>African Languages Speech-to-Text</h1>
 
-    <label for="lang">Language:</label><br>
+    <label for="lang">Language / Provider:</label><br>
     <select id="lang" onchange="updateProvider()">
         <optgroup label="ElevenLabs Scribe v2">
-            <option value="ha">Hausa</option>
-            <option value="ig">Igbo</option>
-            <option value="sw">Swahili</option>
-            <option value="xh">Xhosa</option>
-            <option value="zu">Zulu</option>
+            <option value="eleven:ha">Hausa</option>
+            <option value="eleven:ig">Igbo</option>
+            <option value="eleven:sw">Swahili</option>
+            <option value="eleven:xh">Xhosa</option>
+            <option value="eleven:zu">Zulu</option>
         </optgroup>
-        <optgroup label="Intron (file API)">
-            <option value="yo">Yoruba</option>
-            <option value="tw">Twi</option>
+        <optgroup label="Intron (cloud)">
+            <option value="intron:yo">Yoruba</option>
+            <option value="intron:tw">Twi</option>
+        </optgroup>
+        <optgroup label="HuggingFace Whisper (local)">
+            <option value="hf:yo">Yoruba (NCAIR1/Yoruba-ASR)</option>
+            <option value="hf:tw">Twi (Whisper-FineTuned-DL-Twi)</option>
         </optgroup>
     </select>
     <div class="provider" id="provider"></div>
@@ -41,33 +45,38 @@
     <button id="recordBtn" onclick="toggleRecording()">🎙 Record</button>
     <div id="status"></div>
     <div class="hint" id="intronHint" style="display:none;">
-        Note: Intron sync API supports recordings ≤ 60 seconds. Longer audio will be polled asynchronously and may take longer to return.
+        Note: Intron sync API supports recordings ≤ 60 seconds. Longer audio polls asynchronously.
+    </div>
+    <div class="hint" id="hfHint" style="display:none;">
+        Note: First use downloads the model (~1 GB) to your local cache. Subsequent runs are fast. Keep clips ≤ 30 seconds for best Whisper results.
     </div>
     <h3>Transcription:</h3>
     <div id="result">—</div>
 
     <script>
-        const INTRON_LANGS = new Set(['yo', 'tw']);
-
         const btn = document.getElementById('recordBtn');
         const status = document.getElementById('status');
         const result = document.getElementById('result');
         const langSelect = document.getElementById('lang');
         const providerEl = document.getElementById('provider');
         const intronHint = document.getElementById('intronHint');
+        const hfHint = document.getElementById('hfHint');
 
         let mediaRecorder = null;
         let chunks = [];
         let recording = false;
 
-        function providerFor(lang) {
-            return INTRON_LANGS.has(lang) ? 'Intron file API' : 'ElevenLabs Scribe v2';
+        function providerFor(selection) {
+            if (selection.startsWith('intron:')) return 'Intron (cloud)';
+            if (selection.startsWith('hf:'))     return 'HuggingFace Whisper (local)';
+            return 'ElevenLabs Scribe v2';
         }
 
         function updateProvider() {
-            const lang = langSelect.value;
-            providerEl.textContent = 'Provider: ' + providerFor(lang);
-            intronHint.style.display = INTRON_LANGS.has(lang) ? 'block' : 'none';
+            const sel = langSelect.value;
+            providerEl.textContent = 'Provider: ' + providerFor(sel);
+            intronHint.style.display = sel.startsWith('intron:') ? 'block' : 'none';
+            hfHint.style.display     = sel.startsWith('hf:')     ? 'block' : 'none';
         }
         updateProvider();
 
@@ -100,14 +109,17 @@
                 btn.textContent = '🎙 Record';
                 btn.classList.remove('recording');
                 btn.disabled = true;
-                status.textContent = 'Transcribing with ' + providerFor(langSelect.value) + '… (this may take up to a minute)';
+                const sel = langSelect.value;
+                let msg = 'Transcribing with ' + providerFor(sel) + '…';
+                if (sel.startsWith('hf:')) msg += ' (first run downloads the model, may take a few minutes)';
+                status.textContent = msg;
             }
         }
 
         async function sendAudio(blob) {
             const fd = new FormData();
             fd.append('audio', blob, 'recording.webm');
-            fd.append('language', langSelect.value);
+            fd.append('selection', langSelect.value);
 
             try {
                 const resp = await fetch('/transcribe', { method: 'POST', body: fd });
@@ -115,7 +127,8 @@
 
                 if (resp.ok) {
                     result.textContent = data.text || '(no speech detected)';
-                    status.textContent = 'Done — language: ' + (data.language || 'N/A');
+                    status.textContent = 'Done — ' + (data.provider || providerFor(langSelect.value))
+                        + ' · language: ' + (data.language || 'N/A');
                 } else {
                     let msg = 'Error: ' + (data.error || 'Unknown error');
                     if (data.detail) {
