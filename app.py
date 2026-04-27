@@ -2,6 +2,7 @@ import os
 import time
 import tempfile
 import threading
+import warnings
 from flask import Flask, render_template, request, jsonify
 import requests
 
@@ -22,7 +23,7 @@ INTRON_API_KEY = os.environ.get(
 #   1. Accept terms at https://huggingface.co/NCAIR1/Yoruba-ASR
 #   2. Create a READ token at https://huggingface.co/settings/tokens
 #   3. Paste below or set HF_TOKEN env var
-HF_TOKEN = os.environ.get("HF_TOKEN", "PASTE_YOUR_HF_TOKEN_HERE")
+HF_TOKEN = os.environ.get("HF_TOKEN", "LOGAN_ADDS_HERE")
 
 # ---------------------------------------------------------------------------
 # Intron endpoints
@@ -48,6 +49,11 @@ HF_LANGUAGES = {"yo": "Yoruba", "tw": "Twi"}
 HF_MODELS = {
     "yo": "NCAIR1/Yoruba-ASR",                     # gated
     "tw": "dkt-py-bot/Whisper-FineTuned-DL-Twi",   # open
+}
+
+WHISPER_LANGUAGE_HINTS = {
+    "yo": "yoruba",
+    "tw": "twi",
 }
 
 
@@ -83,6 +89,7 @@ def get_pipeline(lang):
             kwargs["token"] = HF_TOKEN
 
         pipe = hf_pipeline(**kwargs)
+        _configure_asr_pipeline(pipe)
         _pipelines[lang] = pipe
         print(f"[init] {model_id} ready ✓")
         return pipe
@@ -125,7 +132,7 @@ def transcribe():
     if provider == "hf":
         if lang not in HF_LANGUAGES:
             return jsonify({"error": f"HuggingFace does not handle language: {lang}"}), 400
-        return transcribe_local(audio_bytes, lang)
+        return transcribe_local(audio_bytes, lang, filename)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +246,7 @@ def poll_intron(file_id, lang, max_attempts=45, delay_seconds=2):
 # ---------------------------------------------------------------------------
 # HuggingFace local Whisper
 # ---------------------------------------------------------------------------
-def transcribe_local(audio_bytes, lang):
+def transcribe_local(audio_bytes, lang, filename="recording.webm"):
     if lang == "yo" and (not HF_TOKEN or HF_TOKEN.startswith("PASTE_")):
         return jsonify({
             "error": (
@@ -251,13 +258,15 @@ def transcribe_local(audio_bytes, lang):
         }), 500
 
     try:
-        import librosa
+        import librosa  # noqa: F401  (used inside _load_audio_16k_mono for resampling)
+        import soundfile  # noqa: F401
     except ImportError:
         return jsonify({
-            "error": "librosa is not installed. Run: pip install librosa soundfile"
+            "error": "Missing audio libraries. Run: pip install librosa soundfile"
         }), 500
 
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+    suffix = os.path.splitext(filename or "recording.webm")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
@@ -276,11 +285,11 @@ def transcribe_local(audio_bytes, lang):
         return jsonify({"error": f"Failed to load model: {msg}"}), 500
 
     try:
-        audio_array, _ = librosa.load(tmp_path, sr=16000, mono=True)
+        audio_array = _load_audio_16k_mono(tmp_path)
         duration = len(audio_array) / 16000
         print(f"[hf/{lang}] audio loaded: {len(audio_array)} samples ({duration:.1f}s)")
 
-        result = pipe(audio_array)
+        result = _run_asr_pipeline(pipe, audio_array, lang)
         text = result.get("text", "") if isinstance(result, dict) else str(result)
         print(f"[hf/{lang}] transcription: {text!r}")
         return jsonify({
@@ -289,11 +298,174 @@ def transcribe_local(audio_bytes, lang):
             "provider": f"HuggingFace ({HF_MODELS[lang]})",
         })
     except Exception as e:
-        print(f"[hf/{lang}] transcription failed: {e}")
-        return jsonify({"error": f"Transcription failed: {e}"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Transcription failed: {type(e).__name__}: {e}"}), 500
     finally:
         try: os.unlink(tmp_path)
         except OSError: pass
+
+
+def _configure_asr_pipeline(pipe):
+    model_config = getattr(getattr(pipe, "model", None), "config", None)
+    if getattr(model_config, "model_type", None) != "whisper":
+        return
+
+    generation_config = getattr(getattr(pipe, "model", None), "generation_config", None)
+    if generation_config is None:
+        return
+
+    generation_config.forced_decoder_ids = None
+
+
+def _run_asr_pipeline(pipe, audio_array, lang):
+    model_config = getattr(getattr(pipe, "model", None), "config", None)
+    if getattr(model_config, "model_type", None) != "whisper":
+        result = pipe(audio_array)
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
+        if _looks_degenerate_transcript(text):
+            raise RuntimeError("ASR produced a repetitive loop instead of a stable transcript.")
+        return result
+
+    attempts = []
+
+    primary_kwargs = {
+        "task": "transcribe",
+        "no_repeat_ngram_size": 4,
+        "repetition_penalty": 1.15,
+    }
+    language_hint = WHISPER_LANGUAGE_HINTS.get(lang)
+    if language_hint:
+        primary_kwargs["language"] = language_hint
+
+    attempts.append(primary_kwargs)
+    attempts.append({
+        "task": "transcribe",
+        "no_repeat_ngram_size": 4,
+        "repetition_penalty": 1.15,
+    })
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*custom logits processor.*will take precedence.*",
+        )
+        last_error = None
+        for generate_kwargs in attempts:
+            try:
+                result = pipe(audio_array, generate_kwargs=generate_kwargs)
+            except ValueError as exc:
+                if "language" in str(exc).lower() and "language" in generate_kwargs:
+                    last_error = exc
+                    continue
+                raise
+
+            text = result.get("text", "") if isinstance(result, dict) else str(result)
+            cleaned = _clean_transcript_text(text)
+            if _looks_degenerate_transcript(cleaned):
+                last_error = RuntimeError(
+                    f"ASR produced a repetitive loop with settings: {generate_kwargs}"
+                )
+                continue
+
+            if isinstance(result, dict):
+                result["text"] = cleaned
+            return result
+
+        raise last_error or RuntimeError("ASR failed to produce a stable transcript.")
+
+
+def _clean_transcript_text(text):
+    words = text.split()
+    if not words:
+        return text.strip()
+
+    cleaned = []
+    for word in words:
+        if len(cleaned) >= 3 and cleaned[-1] == cleaned[-2] == cleaned[-3] == word:
+            continue
+        cleaned.append(word)
+    return " ".join(cleaned).strip()
+
+
+def _looks_degenerate_transcript(text):
+    words = text.split()
+    if len(words) < 12:
+        return False
+
+    unique_ratio = len(set(words)) / len(words)
+    if unique_ratio < 0.2:
+        return True
+
+    max_run = 1
+    run = 1
+    for idx in range(1, len(words)):
+        if words[idx] == words[idx - 1]:
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 1
+    if max_run >= 6:
+        return True
+
+    phrase = words[:3]
+    if len(phrase) == 3:
+        repeats = 0
+        for idx in range(0, len(words) - 2, 3):
+            if words[idx:idx + 3] == phrase:
+                repeats += 1
+            else:
+                break
+        if repeats >= 4:
+            return True
+
+    return False
+
+
+def _load_audio_16k_mono(path):
+    """Decode any audio file to a 16 kHz mono float32 numpy array.
+
+    Tries soundfile first (works for WAV/FLAC/OGG). Falls back to ffmpeg via
+    subprocess for formats like WebM. Surfaces a clear error if ffmpeg is missing.
+    """
+    import numpy as np
+    ext = os.path.splitext(path)[1].lower()
+    ffmpeg_first_exts = {".webm", ".m4a", ".mp4", ".aac", ".opus", ".mp3"}
+
+    if ext not in ffmpeg_first_exts:
+        try:
+            import soundfile as sf
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+            data = data.mean(axis=1)  # mono
+            if sr != 16000:
+                import librosa
+                data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+            return data.astype(np.float32)
+        except Exception as sf_err:
+            print(f"[audio] soundfile failed ({sf_err}); falling back to ffmpeg")
+    else:
+        print(f"[audio] using ffmpeg for {ext} input")
+
+    # ffmpeg fallback — handles WebM, M4A, etc.
+    import shutil, subprocess
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg is not installed or not on PATH. Install it and restart Flask. "
+            "Windows: https://www.gyan.dev/ffmpeg/builds/ (add bin/ to PATH). "
+            "macOS: brew install ffmpeg. Ubuntu: sudo apt install ffmpeg."
+        )
+
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-i", path,
+             "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+            capture_output=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg decode failed: {e.stderr.decode(errors='ignore')}") from e
+
+    import numpy as np
+    return np.frombuffer(proc.stdout, dtype=np.float32)
 
 
 def safe_json(resp):
